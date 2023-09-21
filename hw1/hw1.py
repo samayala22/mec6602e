@@ -124,16 +124,16 @@ class custom_simon: # 10
 schemes = [explicit_backward(), explicit_forward(), explicit_centered(), leap_frog(), lax_wendroff(), lax(), hybrid0(), hybrid1(), crank_nicolson(), implicit_upwind(), custom_simon()]
 
 if __name__ == "__main__":
-    assert len(sys.argv) <= 2, "Too many arguments"
-    scheme_nb = int(sys.argv[1]) if (len(sys.argv) == 2) else 0
+    assert len(sys.argv) <= 3, "Too many arguments"
+    scheme_nb = int(sys.argv[1]) if (len(sys.argv) >= 2) else 0
+    nb_pts = int(sys.argv[2]) if (len(sys.argv) >= 3) else 200
     assert scheme_nb >= 0 and scheme_nb <= len(schemes), "Invalid scheme number"
 
     # Paramètres
     x_interval = [0, np.pi]
-    nb_pts = 200
     c = 35.0
     t_final = 1.75 / c # this makes sure that the wave is at x = 2.5 at the end of the simulation
-    cfl = 0.8
+    cfl = 1.0
     t = 0
 
     # Calculated discretization parameters
