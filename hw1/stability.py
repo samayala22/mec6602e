@@ -22,6 +22,9 @@ def lax(phi, cfl):
 def central_implicit(phi, cfl):
     return 1 / (1+(cfl*np.sin(phi)**2))
 
+def crank_nicolson(phi, cfl):
+    return ((2-(cfl*np.sin(phi))**2)/(2*(1+(cfl*np.sin(phi))**2)))**2 + ((3*np.sin(phi))/(2*(1+(cfl*np.sin(phi))**2)))**2
+
 schemes = [
     {
         "name": "Backward explicit",
@@ -50,17 +53,29 @@ schemes = [
     {
         "name": "Central implicit",
         "func": central_implicit
+    },
+    {
+        "name": "Crank-Nicolson",
+        "func": crank_nicolson
     }
 ]
 
 if __name__ == "__main__":
-    cfls = [0.25, 0.5, 0.8, 1.0]
-    markers = ["o", "s", "D", "^"]
+    cfls_explicit = [0.25, 0.5, 0.8, 1.0]
+    cfls_implicit = [0.25, 0.5, 0.85, 1.0, 10.0]
+    markers = ["o", "s", "D", "^", "v"]
     phi = np.linspace(0, np.pi, 1000)
     gradient = np.tile(np.linspace(1,0,512), (512, 1)).T
 
     for scheme in schemes:
         plt.figure(figsize=(12,7), dpi=100)
+        cfls = cfls_explicit
+        markers = ["o", "s", "D", "^"]
+
+        if scheme["name"] == "Central implicit" or scheme["name"] == "Crank-Nicolson":
+            cfls = cfls_implicit
+            markers = ["o", "s", "D", "^", "v"]
+
         for cfl, marker in zip(cfls, markers):
             plt.plot(phi, scheme["func"](phi, cfl), marker=marker, markevery=50, label=f"CFL={cfl}")
 

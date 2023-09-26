@@ -167,10 +167,7 @@ if __name__ == "__main__":
             t += dt
             pbar.update()
 
-    # if (abs(u[int(2.5/dx)] - 1.0) > 1e-2):
-    #     print("Solution is wrong")
-    # else:
-    #     print("Solution is correct")
-
     plt.plot(x, u[2:-2])
+    plt.ylabel("u")
+    plt.xlabel("x")
     plt.show()
