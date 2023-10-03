@@ -48,8 +48,8 @@ struct Mesh {
     std::vector<f64> area;
     const f32 x0;
     const f32 x1;
+    const u32 n;
     f32 dx; 
-    u32 n;
 
     Mesh(u32 size, f32 x0_, f32 x1_): n(size), x0(x0_), x1(x1_) {
         area.resize(size+2);
