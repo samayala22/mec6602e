@@ -3,6 +3,10 @@
 #include <cstdint>
 #include <algorithm>
 #include <cmath>
+#include <memory>
+#include <fstream>
+
+#include "sciplot/sciplot.hpp"
 
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
@@ -12,28 +16,51 @@ using f64 = double;
 
 // conservative variables
 struct u_t {
-    f64 rho_a;
-    f64 rho_ua;
-    f64 rho_ea;
+    f64 rho_a = 0.0;
+    f64 rho_ua = 0.0;
+    f64 ea = 0.0;
 };
 
 // primitive variables
 struct w_t {
-    f64 rho;
-    f64 u;
-    f64 p;
+    f64 rho = 0.0;
+    f64 u = 0.0;
+    f64 e = 0.0;
+    f64 p = 0.0;
+    f64 c = 0.0;
+    w_t(const u_t& cons, const f64 a) {
+        static const f32 gamma = 1.4;
+        rho = cons.rho_a / a;
+        u = cons.rho_ua / cons.rho_a;
+        e = cons.ea / a;
+        p = (gamma - 1.0f) * (cons.ea/a - 0.5 * rho * u * u);
+        c = std::sqrt(gamma * (p / rho));
+    }
+
+    w_t(const f64 rho_, const f64 u_, const f64 p_) {
+        static const f32 gamma = 1.4;
+        rho = rho_;
+        u = u_;
+        p = p_;
+        e = p / (gamma - 1) + 0.5 * rho * u*u;
+        c = std::sqrt(gamma * (p / rho));
+    }
 };
 
 // conservative variables vectors
 struct u_vec_t {
     std::vector<f64> rho_a;
     std::vector<f64> rho_ua;
-    std::vector<f64> rho_ea;
+    std::vector<f64> ea;
 
-    void alloc(u32 size) {
-        rho_a.resize(size+2);
-        rho_ua.resize(size+2);
-        rho_ea.resize(size+2);
+    void alloc(u64 size) {
+        rho_a.resize(size);
+        rho_ua.resize(size);
+        ea.resize(size);
+    }
+
+    u_t get(u64 i) const {
+        return {rho_a[i], rho_ua[i], ea[i]};
     }
 };
 
@@ -46,13 +73,16 @@ struct w_vec_t {
 
 struct Mesh {
     std::vector<f64> area;
-    const f32 x0;
-    const f32 x1;
-    const u32 n;
-    f32 dx; 
+    f32 x0 = 0.0f;
+    f32 x1 = 1.0f;
+    u64 n = 100;
+    f32 dx = 0.0f; 
 
-    Mesh(u32 size, f32 x0_, f32 x1_): n(size), x0(x0_), x1(x1_) {
+    void set_dims(u64 size, f32 x0_, f32 x1_) {
+        n = size;
         area.resize(size+2);
+        x0 = x0_;
+        x1 = x1_;
         dx = (x1 - x0) / (n - 1);
     }
 
@@ -62,8 +92,8 @@ struct Mesh {
 
     void generate_nozzle() {
         f32 x = x0;
-        for (u32 i = 1; i < n+1; i++) {
-            area[i] = 1.398f + 0.347f * std::tanh(0.8f * (x + 0.5*dx) - 4.0f); // nozzle profile 
+        for (u64 i = 1; i < n+1; i++) {
+            area[i] = 1.398f + 0.347f * std::tanh(0.8f * x - 4.0f); // nozzle profile 
             x += dx;
         }
         area[0] = area[1]; // left ghost cell 
@@ -71,21 +101,247 @@ struct Mesh {
     }
 };
 
-class Scheme {
+u_t convective_flux(const w_t& w, const f32 area) {
+    u_t f;
+    f.rho_a = w.rho * w.u * area;
+    f.rho_ua = (w.rho * w.u * w.u + w.p) * area;
+    f.ea = w.u * (w.e + w.p) * area;
+    return f;
+}
 
+class BoundaryCondition {
+    public:
+    virtual void apply(u_vec_t& u) = 0;
+    virtual ~BoundaryCondition() = default;
+};
+
+class ShockTube : public BoundaryCondition {
+    public:
+    void apply(u_vec_t& u) override {
+        const u64 end = u.rho_a.size() - 1;
+        u.rho_a[0] = u.rho_a[1];
+        u.rho_ua[0] = u.rho_ua[1];
+        u.ea[0] = u.ea[1];
+
+        u.rho_a[end] = u.rho_a[end-1];
+        u.rho_ua[end] = u.rho_ua[end-1];
+        u.ea[end] = u.ea[end-1];
+    }
+};
+
+class TimeState {
+    public:
+    f64 cfl = 1.0;
+    f64 residual0 = 1.0; // initial residual
+    std::vector<f64> dt;
+    virtual void calc_dt(const Mesh& m, const u_vec_t& u) = 0;
+    virtual bool has_converged(f64 residual) = 0;
+    
+    void calc_dt_all(const Mesh& m, const u_vec_t& u) {
+        for (u64 i = 1; i < m.n+1; i++) {
+            w_t w_c(u.get(i), m.area[i]);
+            dt[i] = cfl * m.dx / (std::abs(w_c.u) + w_c.c);
+        }
+    }
+
+    TimeState(Mesh& m) {
+        dt.resize(m.n+2);
+    }
+    virtual ~TimeState() = default;
+};
+
+class Steady : public TimeState {
+    public:
+    f64 target_convergence;
+    void calc_dt(const Mesh& m, const u_vec_t& u) override {
+        calc_dt_all(m, u);
+    };
+    bool has_converged(f64 residual) override {
+        return (std::log10(residual0 / residual) > target_convergence);
+    }
+    Steady(Mesh& m, f64 target_convergence_): TimeState(m), target_convergence(target_convergence_) {};
+};
+
+class Transient : public TimeState {
+    public:
+    f64 t = 0.0;
+    f64 t_final = 1.0;
+    void calc_dt(const Mesh& m, const u_vec_t& u) override {
+        calc_dt_all(m, u);
+        f64 min_dt = *std::min_element(dt.begin()+1, dt.end()-1);
+        if (t + min_dt > t_final) min_dt = t_final - t;
+        t += min_dt;
+        std::fill(dt.begin(), dt.end(), min_dt);
+    };
+    bool has_converged(f64 residual) override {
+        return (t == t_final);
+    }
+    Transient(Mesh& m, f64 t_final_): TimeState(m), t_final(t_final_) {};
+};
+
+class Scheme {
+    public:
+    Mesh& m;
+    std::unique_ptr<TimeState> ts;
+    std::unique_ptr<BoundaryCondition> bc;
+
+    virtual void solution(u_vec_t& u, u_vec_t& update) = 0;
+    Scheme(Mesh& m_): m(m_) {};
+    virtual ~Scheme() = default;
 };
 
 class MacCormack : public Scheme {
+    public:
+    u_vec_t pred;
+    u_vec_t corr;
+    void solution(u_vec_t& u, u_vec_t& update) override {
+        bc->apply(u);
+        // predictor
+        for (u64 i = 1; i < m.n+1; i++) {
+            w_t w_c = w_t(u.get(i), m.area[i]); // w cell
+            w_t w_r = w_t(u.get(i+1), m.area[i+1]); // w left cell
 
+            u_t f_c = convective_flux(w_c, m.area[i]);
+            u_t f_r = convective_flux(w_r, m.area[i+1]);
+            
+            f64 pred_rhoa = u.rho_a[i] - ts->dt[i] * (f_r.rho_a - f_c.rho_a) / m.dx;
+            pred.rho_a[i] = pred_rhoa;
+            pred.rho_ua[i] = u.rho_ua[i] - ts->dt[i] * (f_r.rho_ua - f_c.rho_ua) / m.dx;
+            pred.ea[i] = u.ea[i] - ts->dt[i] * (f_r.ea - f_c.ea) / m.dx;
+        }
+
+        bc->apply(pred);
+
+        // corrector
+        for (u64 i = 1; i < m.n+1; i++) {
+            w_t w_c = w_t(pred.get(i), m.area[i]); // w cell
+            w_t w_l = w_t(pred.get(i-1), m.area[i-1]); // w right cell
+
+            u_t f_c = convective_flux(w_c, m.area[i]);
+            u_t f_l = convective_flux(w_l, m.area[i-1]);
+
+            corr.rho_a[i] = u.rho_a[i] - ts->dt[i] * (f_c.rho_a - f_l.rho_a) / m.dx;
+            corr.rho_ua[i] = u.rho_ua[i] - ts->dt[i] * (f_c.rho_ua - f_l.rho_ua) / m.dx;
+            corr.ea[i] = u.ea[i] - ts->dt[i] * (f_c.ea - f_l.ea) / m.dx;
+        }
+
+        // update
+        for (u64 i = 1; i < m.n+1; i++) {
+            update.rho_a[i] = 0.5 * (pred.rho_a[i] + corr.rho_a[i]) - u.rho_a[i];
+            update.rho_ua[i] = 0.5 * (pred.rho_ua[i] + corr.rho_ua[i]) - u.rho_ua[i];
+            update.ea[i] = 0.5 * (pred.ea[i] + corr.ea[i]) - u.ea[i];
+        }
+    };
+
+    MacCormack(Mesh& m_): Scheme(m_) {
+        pred.alloc(m.n+2);
+        corr.alloc(m.n+2);
+    }
 };
 
-class BeamWarming : public Scheme {
-
-};
-
+f64 update_solution(u_vec_t& u, u_vec_t& update) {
+    f64 residual_l2 = 0.0;
+    for (u64 i = 1; i < u.rho_a.size()-1; i++) {
+        u.rho_a[i] += update.rho_a[i];
+        u.rho_ua[i] += update.rho_ua[i];
+        u.ea[i] += update.ea[i];
+        residual_l2 += update.rho_a[i] * update.rho_a[i];
+    }
+    return std::sqrt(residual_l2) / (u.rho_a.size() - 2);
+}
 
 int main(int argc, char** argv) {
     std::cout << "-- HW2 --\n";
+    
+    std::string scheme = "mac-cormack";
+    std::string test_case = "shock-tube";
+
+    u64 n = 100;
+
+    Mesh mesh;
+    std::unique_ptr<Scheme> s;
+
+    u_vec_t u; // u_n
+    u_vec_t update; // delta_u_n
+    u.alloc(n+2);
+    update.alloc(n+2);
+
+    if (test_case == "shock-tube") {
+        mesh.set_dims(n, 0.0f, 1.0f);
+        mesh.generate_grid();
+        // w_t left(4.0, 0.0, 4.0);
+        // w_t right(1.0, 0.0, 1.0);
+        w_t left(1.0, 0.0, 1.0);
+        w_t right(0.125, 0.0, 0.1);
+        f32 x = 0.0f;
+        for (u64 i = 1; i < n+1; i++) {
+            if (x < 0.5f) {
+                u.rho_a[i] = left.rho * mesh.area[i];
+                u.rho_ua[i] = left.rho * left.u * mesh.area[i];
+                u.ea[i] = left.e * mesh.area[i];
+            } else {
+                u.rho_a[i] = right.rho * mesh.area[i];
+                u.rho_ua[i] = right.rho * right.u * mesh.area[i];
+                u.ea[i] = right.e * mesh.area[i];
+            }
+            x += mesh.dx;
+        }
+
+    } else {
+        std::cout << "Test case not implemented\n";
+        return 1;
+    }
+
+    if (scheme == "mac-cormack") {
+        s = std::make_unique<MacCormack>(mesh);
+    } else {
+        std::cout << "Scheme not implemented\n";
+        return 1;
+    }
+
+    if (test_case == "shock-tube") {
+        s->bc = std::make_unique<ShockTube>();
+        s->ts = std::make_unique<Transient>(mesh, 0.2); // t_final = 250
+    }
+    
+    // First iteration
+    u64 iterations = 0;
+    s->ts->calc_dt(mesh, u);
+    s->solution(u, update);
+    f64 residual0 = update_solution(u, update);
+    s->ts->residual0 = residual0;
+    f64 l2res = residual0;
+    std::cout << "Iteration: " << iterations << " Residual: " << l2res << "\n";
+    // Solver loop
+    while (!s->ts->has_converged(l2res)) {
+        s->ts->calc_dt(mesh, u);
+        s->solution(u, update);
+        l2res = update_solution(u, update);
+        iterations++;
+    }
+
+    std::cout << "Iterations: " << iterations << "\n";
+
+
+    std::ifstream sod_tube("sod-exact_solution.txt");
+    std::vector<f64> x_exact;
+    std::vector<f64> rho_exact;
+    while (!sod_tube.eof()) {
+        f64 x, rho, u, p;
+        sod_tube >> x >> rho >> u >> p;
+        x_exact.push_back(x);
+        rho_exact.push_back(rho);
+    }
+
+    sciplot::Vec x = sciplot::linspace(0.0, 1.0, n+2);
+    sciplot::Plot2D plot1;
+    plot1.drawCurve(x, u.rho_a).label("mc-cormack").lineWidth(2);
+    plot1.drawCurve(x_exact, rho_exact).label("exact").lineWidth(2);
+
+    sciplot::Figure figure = {{plot1}};
+    sciplot::Canvas canvas = {{figure}};
+    canvas.size(1280, 720);
+    canvas.save("sod_tube.png");
 
     return 0;
 }

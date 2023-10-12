@@ -1,1 +1,6 @@
 *.png
+.cache/
+.vscode/
+.xmake/
+build/
+compile_commands.json
