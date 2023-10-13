@@ -111,13 +111,13 @@ u_t convective_flux(const w_t& w, const f32 area) {
 
 class BoundaryCondition {
     public:
-    virtual void apply(u_vec_t& u) = 0;
+    virtual void apply(u_vec_t& u, std::vector<f64>& area) = 0;
     virtual ~BoundaryCondition() = default;
 };
 
 class ShockTube : public BoundaryCondition {
     public:
-    void apply(u_vec_t& u) override {
+    void apply(u_vec_t& u, std::vector<f64>& area) override {
         const u64 end = u.rho_a.size() - 1;
         u.rho_a[0] = u.rho_a[1];
         u.rho_ua[0] = u.rho_ua[1];
@@ -127,6 +127,39 @@ class ShockTube : public BoundaryCondition {
         u.rho_ua[end] = u.rho_ua[end-1];
         u.ea[end] = u.ea[end-1];
     }
+};
+
+class Nozzle : public BoundaryCondition {
+    w_t inf; // inlet conditions
+    f64 back_pressure_factor = 1.9; // back pressure factor (P_back / P_inlet)
+    public:
+    void apply(u_vec_t& u, std::vector<f64>& area) override {
+        const u64 end = u.rho_a.size() - 1;
+        const f64 gamma = 1.4;
+        // inlet (assumed always supersonic)
+        u.rho_a[0] = inf.rho * area[0];
+        u.rho_ua[0] = inf.rho * inf.u * area[0];
+        u.ea[0] = inf.e * area[0];
+
+        // outlet
+        w_t lc(u.get(end-1), area[end-1]); // last cell
+
+        // supersonic (Blazek Eq 8.20)
+        // u.rho_a[end] = u.rho_a[end-1];
+        // u.rho_ua[end] = u.rho_ua[end-1];
+        // u.ea[end] = u.ea[end-1];
+
+        // subsonic (Blazek Eq 8.23)
+        f64 pb = inf.p * back_pressure_factor;
+        f64 rhob = lc.rho + (pb - lc.p) / (lc.c * lc.c);
+        f64 ub = lc.u + (lc.p - pb) / (lc.rho * lc.c);
+        f64 eb = pb / (gamma - 1) + 0.5 * rhob * ub*ub;
+
+        u.rho_a[end] = rhob * area[end];
+        u.rho_ua[end] = rhob * ub * area[end];
+        u.ea[end] = eb * area[end];
+    }
+    Nozzle(f64 rho_, f64 u_, f64 p_): inf(rho_, u_, p_) {};
 };
 
 class TimeState {
@@ -195,7 +228,7 @@ class MacCormack : public Scheme {
     u_vec_t pred;
     u_vec_t corr;
     void solution(u_vec_t& u, u_vec_t& update) override {
-        bc->apply(u);
+        bc->apply(u, m.area);
         // predictor
         for (u64 i = 1; i < m.n+1; i++) {
             w_t w_c = w_t(u.get(i), m.area[i]); // w cell
@@ -204,13 +237,12 @@ class MacCormack : public Scheme {
             u_t f_c = convective_flux(w_c, m.area[i]);
             u_t f_r = convective_flux(w_r, m.area[i+1]);
             
-            f64 pred_rhoa = u.rho_a[i] - ts->dt[i] * (f_r.rho_a - f_c.rho_a) / m.dx;
-            pred.rho_a[i] = pred_rhoa;
-            pred.rho_ua[i] = u.rho_ua[i] - ts->dt[i] * (f_r.rho_ua - f_c.rho_ua) / m.dx;
+            pred.rho_a[i] = u.rho_a[i] - ts->dt[i] * (f_r.rho_a - f_c.rho_a) / m.dx;
+            pred.rho_ua[i] = u.rho_ua[i] - ts->dt[i] * (f_r.rho_ua - f_c.rho_ua) / m.dx + ts->dt[i] * w_c.p * (m.area[i+1] - m.area[i-1]) / (2.0 * m.dx);
             pred.ea[i] = u.ea[i] - ts->dt[i] * (f_r.ea - f_c.ea) / m.dx;
         }
 
-        bc->apply(pred);
+        bc->apply(pred, m.area);
 
         // corrector
         for (u64 i = 1; i < m.n+1; i++) {
@@ -221,7 +253,7 @@ class MacCormack : public Scheme {
             u_t f_l = convective_flux(w_l, m.area[i-1]);
 
             corr.rho_a[i] = u.rho_a[i] - ts->dt[i] * (f_c.rho_a - f_l.rho_a) / m.dx;
-            corr.rho_ua[i] = u.rho_ua[i] - ts->dt[i] * (f_c.rho_ua - f_l.rho_ua) / m.dx;
+            corr.rho_ua[i] = u.rho_ua[i] - ts->dt[i] * (f_c.rho_ua - f_l.rho_ua) / m.dx + ts->dt[i] * w_c.p * (m.area[i+1] - m.area[i-1]) / (2.0 * m.dx);
             corr.ea[i] = u.ea[i] - ts->dt[i] * (f_c.ea - f_l.ea) / m.dx;
         }
 
@@ -252,11 +284,16 @@ f64 update_solution(u_vec_t& u, u_vec_t& update) {
 
 int main(int argc, char** argv) {
     std::cout << "-- HW2 --\n";
-    
-    std::string scheme = "mac-cormack";
-    std::string test_case = "shock-tube";
 
-    u64 n = 100;
+    const std::vector<std::string> schemes = {"mac-cormack", "beam-warming"};
+    const std::vector<std::string> test_cases = {"shock-tube", "nozzle"};
+    
+    u32 scheme_idx = 0;
+    u32 test_case_idx = 1;
+    u64 n = 300;
+
+    std::string scheme = schemes.at(scheme_idx);
+    std::string test_case = test_cases.at(test_case_idx);
 
     Mesh mesh;
     std::unique_ptr<Scheme> s;
@@ -266,6 +303,7 @@ int main(int argc, char** argv) {
     u.alloc(n+2);
     update.alloc(n+2);
 
+    // Setup test case
     if (test_case == "shock-tube") {
         mesh.set_dims(n, 0.0f, 1.0f);
         mesh.generate_grid();
@@ -286,12 +324,22 @@ int main(int argc, char** argv) {
             }
             x += mesh.dx;
         }
-
+    } else if (test_case == "nozzle") {
+        mesh.set_dims(n, 0.0f, 10.0f);
+        mesh.generate_nozzle();
+        f64 u_vel = 1.3 * std::sqrt(1.4); // we set p = rho = 1.0 and mach = 1.25
+        w_t inf(1.0, u_vel, 1.0);
+        for (u64 i = 1; i < n+1; i++) {
+            u.rho_a[i] = inf.rho * mesh.area[i];
+            u.rho_ua[i] = inf.rho * inf.u * mesh.area[i];
+            u.ea[i] = inf.e * mesh.area[i];
+        }
     } else {
         std::cout << "Test case not implemented\n";
         return 1;
     }
 
+    // Setup scheme
     if (scheme == "mac-cormack") {
         s = std::make_unique<MacCormack>(mesh);
     } else {
@@ -302,6 +350,9 @@ int main(int argc, char** argv) {
     if (test_case == "shock-tube") {
         s->bc = std::make_unique<ShockTube>();
         s->ts = std::make_unique<Transient>(mesh, 0.2); // t_final = 250
+    } else if (test_case == "nozzle") {
+        s->bc = std::make_unique<Nozzle>(1.0, 1.3 * std::sqrt(1.4), 1.0);
+        s->ts = std::make_unique<Steady>(mesh, 10); // converge to 1e-10
     }
     
     // First iteration
@@ -311,37 +362,55 @@ int main(int argc, char** argv) {
     f64 residual0 = update_solution(u, update);
     s->ts->residual0 = residual0;
     f64 l2res = residual0;
-    std::cout << "Iteration: " << iterations << " Residual: " << l2res << "\n";
     // Solver loop
     while (!s->ts->has_converged(l2res)) {
         s->ts->calc_dt(mesh, u);
         s->solution(u, update);
         l2res = update_solution(u, update);
+        if (iterations % 10 == 0) std::cout << iterations << " | Residual: " << std::log10(l2res / residual0) << "\n";
         iterations++;
     }
 
     std::cout << "Iterations: " << iterations << "\n";
 
+    if (test_case == "shock-tube") {
+        std::ifstream sod_tube("sod-exact_solution.txt");
+        std::vector<f64> x_exact;
+        std::vector<f64> rho_exact;
+        while (!sod_tube.eof()) {
+            f64 x, rho, u, p;
+            sod_tube >> x >> rho >> u >> p;
+            x_exact.push_back(x);
+            rho_exact.push_back(rho);
+        }
 
-    std::ifstream sod_tube("sod-exact_solution.txt");
-    std::vector<f64> x_exact;
-    std::vector<f64> rho_exact;
-    while (!sod_tube.eof()) {
-        f64 x, rho, u, p;
-        sod_tube >> x >> rho >> u >> p;
-        x_exact.push_back(x);
-        rho_exact.push_back(rho);
+        sciplot::Vec x = sciplot::linspace(0.0, 1.0, n+2);
+        sciplot::Plot2D plot1;
+        plot1.drawCurve(x, u.rho_a).label("mc-cormack").lineWidth(2);
+        plot1.drawCurve(x_exact, rho_exact).label("exact").lineWidth(2);
+
+        sciplot::Figure figure = {{plot1}};
+        sciplot::Canvas canvas = {{figure}};
+        canvas.size(1280, 720);
+        canvas.save("sod_tube.png");
+    } else if (test_case == "nozzle") {
+        std::vector<f64> mach(n+2);
+        for (u64 i = 1; i < n+1; i++) {
+            w_t w_c(u.get(i), mesh.area[i]);
+            mach[i] = w_c.u / w_c.c;
+        }
+        mach[0] = mach[1];
+        mach[n+1] = mach[n];
+
+        sciplot::Vec x = sciplot::linspace(0.0, 10.0, n+2);
+        sciplot::Plot2D plot1;
+        plot1.drawCurve(x, mach).label("mach").lineWidth(2);
+
+        sciplot::Figure figure = {{plot1}};
+        sciplot::Canvas canvas = {{figure}};
+        canvas.size(1280, 720);
+        canvas.save("nozzle_mach.png");
     }
-
-    sciplot::Vec x = sciplot::linspace(0.0, 1.0, n+2);
-    sciplot::Plot2D plot1;
-    plot1.drawCurve(x, u.rho_a).label("mc-cormack").lineWidth(2);
-    plot1.drawCurve(x_exact, rho_exact).label("exact").lineWidth(2);
-
-    sciplot::Figure figure = {{plot1}};
-    sciplot::Canvas canvas = {{figure}};
-    canvas.size(1280, 720);
-    canvas.save("sod_tube.png");
 
     return 0;
 }
