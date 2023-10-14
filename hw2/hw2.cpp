@@ -16,20 +16,21 @@ using f32 = float;
 using f64 = double;
 
 // taken from tinyfvm
-template<typename T, size_t N, size_t M>
+// row major (M = nb_row, N = nb_col)
+template<typename T, size_t M, size_t N>
 struct StaticMatrix {
-    std::array<T, N*M> buf = {};
+    std::array<T, M*N> buf = {};
     
     int size() const {return N*M;}
-    int nb_row() const {return N;}
-    int nb_col() const {return M;}
+    int nb_row() const {return M;}
+    int nb_col() const {return N;}
 
-    T (&data())[N][M] {
-        return reinterpret_cast<T (&)[N][M]>(*buf.data());
+    T (&data())[M][N] {
+        return reinterpret_cast<T (&)[M][N]>(*buf.data());
     };
 
     T& operator()(size_t row, size_t col) {
-        return buf[row * M + col];
+        return buf[row * N + col];
     };
 
     StaticMatrix() = default;
@@ -327,11 +328,12 @@ void compute_jacobian(u_vec_t& u, std::vector<f64>& area, jacobian_t& jac) {
 }
 
 // replace this with Eigen ffs
+// matrix-vector product with matrix in row major
 template<size_t N>
 void matvec(double A[N][N], double B[N], double C[N]) {
     for (size_t i = 0; i < N; i++) {
         for (size_t j = 0; j < N; j++) {
-            C[i] += A[j][i] * B[j]; // Multiply and accumulate
+            C[i] += A[i][j] * B[j]; // Multiply and accumulate
         }
     }
 }
@@ -455,6 +457,14 @@ class BeamWarming : public Scheme {
         f64 residual = 0.0;
 
         for (u64 i = 1; i < u.size() - 1; i++) {
+            u_t u_l = u.get(i-1);
+            u_t u_c = u.get(i);
+            u_t u_r = u.get(i+1);
+            u_t dissip;
+            dissip.rho_a = eps_i * (u_r.rho_a - 2.0 * u_c.rho_a + u_l.rho_a);
+            dissip.rho_ua = eps_i * (u_r.rho_ua - 2.0 * u_c.rho_ua + u_l.rho_ua);
+            dissip.ea = eps_i * (u_r.ea - 2.0 * u_c.ea + u_l.ea);
+
             u_t acc = rhs.get(i);
             block_t b_r = jac[i+1];
             block_t b_l = jac[i-1];
@@ -463,7 +473,8 @@ class BeamWarming : public Scheme {
             f64 c_r[3] = {};
             f64 c_l[3] = {};
 
-            f64 eps[3] = {0.0, 0.0, 0.0};
+            //f64 eps[3] = {0.0, 0.0, 0.0};
+            f64 eps[3] = {-dissip.rho_a, -dissip.rho_ua, -dissip.ea};
 
             matscale<3>(b_r.data(), ts->dt[i] / (4.0 * m.dx), eps);
             matscale<3>(b_l.data(), - ts->dt[i] / (4.0 * m.dx), eps);
@@ -475,13 +486,23 @@ class BeamWarming : public Scheme {
             acc.rho_ua -= (c_r[1] + c_l[1]);
             acc.ea -= (c_r[2] + c_l[2]);
 
+            f64 B[3] = {acc.rho_a, acc.rho_ua, acc.ea};
+            f64 C[3] = {};
+            
+            block_t inv_diag;
+            inv_diag(0,0) = 1 / (1.0 + 2.0*dissip.rho_a);
+            inv_diag(1,1) = 1 / (1.0 + 2.0*dissip.rho_ua);
+            inv_diag(2,2) = 1 / (1.0 + 2.0*dissip.ea);
+
+            matvec<3>(inv_diag.data(), B, C);
+
             // multiply by inv of diag block but rn is just I
-            f64 diff = acc.rho_a - update.rho_a[i];
+            f64 diff = C[0] - update.rho_a[i];
             residual += diff * diff;
 
-            update.rho_a[i] = acc.rho_a;
-            update.rho_ua[i] = acc.rho_ua;
-            update.ea[i] = acc.ea;
+            update.rho_a[i] = C[0];
+            update.rho_ua[i] = C[1];
+            update.ea[i] = C[2];
         }
         return std::sqrt(residual) / (u.size() - 2);
     };
@@ -494,7 +515,8 @@ class BeamWarming : public Scheme {
         f64 gs_residual0 = gs_sweep(u, update);
         f64 gs_residual = gs_residual0;
         u32 sweep = 1;
-        while(std::log10(gs_residual0 / gs_residual) < 3.0 && sweep < 100) {
+        while(std::log10(gs_residual0 / gs_residual) < 5.0 && sweep < 100) {
+            std::cout << sweep << " | GS res: " << gs_residual << "\n";
             gs_residual = gs_sweep(u, update);
             sweep++;
         }
@@ -599,14 +621,18 @@ int main(int argc, char** argv) {
     f64 residual0 = update_solution(u, update);
     s->ts->residual0 = residual0;
     f64 l2res = residual0;
+
+    // s->ts->calc_dt(mesh, u);
+    // s->solution(u, update);
+    // l2res = update_solution(u, update);
     // Solver loop
-    while (!s->ts->has_converged(l2res)) {
-        s->ts->calc_dt(mesh, u);
-        s->solution(u, update);
-        l2res = update_solution(u, update);
-        if (iterations % 10 == 0) std::cout << iterations << " | Residual: " << std::log10(l2res / residual0) << "\n";
-        iterations++;
-    }
+    // while (!s->ts->has_converged(l2res)) {
+    //     s->ts->calc_dt(mesh, u);
+    //     s->solution(u, update);
+    //     l2res = update_solution(u, update);
+    //     if (iterations % 10 == 0) std::cout << iterations << " | Residual: " << std::log10(l2res / residual0) << "\n";
+    //     iterations++;
+    // }
 
     std::cout << "Iterations: " << iterations << "\n";
 
