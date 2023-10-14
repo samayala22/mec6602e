@@ -5,6 +5,7 @@
 #include <cmath>
 #include <memory>
 #include <fstream>
+#include <array>
 
 #include "sciplot/sciplot.hpp"
 
@@ -13,6 +14,35 @@ using u64 = std::uint64_t;
 
 using f32 = float;
 using f64 = double;
+
+// taken from tinyfvm
+template<typename T, size_t N, size_t M>
+struct StaticMatrix {
+    std::array<T, N*M> buf = {};
+    
+    int size() const {return N*M;}
+    int nb_row() const {return N;}
+    int nb_col() const {return M;}
+
+    T (&data())[N][M] {
+        return reinterpret_cast<T (&)[N][M]>(*buf.data());
+    };
+
+    T& operator()(size_t row, size_t col) {
+        return buf[row * M + col];
+    };
+
+    StaticMatrix() = default;
+    StaticMatrix(const std::initializer_list<std::initializer_list<T>>& init) {
+        auto it = buf.begin();
+        for (const auto& row : init) {
+            for (const auto& elem : row) {
+                *it++ = elem;
+            }
+        }
+    }
+    ~StaticMatrix() = default;
+};
 
 // conservative variables
 struct u_t {
@@ -61,6 +91,10 @@ struct u_vec_t {
 
     u_t get(u64 i) const {
         return {rho_a[i], rho_ua[i], ea[i]};
+    }
+
+    u64 size() const {
+        return rho_a.size();
     }
 };
 
@@ -271,9 +305,210 @@ class MacCormack : public Scheme {
     }
 };
 
+using block_t = StaticMatrix<f64,3,3>;
+using jacobian_t = std::vector<block_t>;
+
+void compute_jacobian(u_vec_t& u, std::vector<f64>& area, jacobian_t& jac) {
+    static const f64 gamma = 1.4;
+    for (u64 i = 0; i < u.size(); i++) {
+        w_t c(u.get(i), area[i]); // cell primitives
+        jac[i](0,0) = 0.0;
+        jac[i](0,1) = 1.0;
+        jac[i](0,2) = 0.0;
+
+        jac[i](1,0) = (gamma - 3.0) * 0.5 * c.u * c.u;
+        jac[i](1,1) = (3.0 - gamma) * c.u;
+        jac[i](1,2) = gamma - 1.0;
+
+        jac[i](2,0) = - gamma * c.e * c.u / c.rho + (gamma - 1.0) * c.u * c.u * c.u;
+        jac[i](2,1) = gamma * c.e / c.rho - 1.5 * (gamma - 1.0) * c.u * c.u;
+        jac[i](2,2) = gamma * c.u;        
+    }
+}
+
+// replace this with Eigen ffs
+template<size_t N>
+void matvec(double A[N][N], double B[N], double C[N]) {
+    for (size_t i = 0; i < N; i++) {
+        for (size_t j = 0; j < N; j++) {
+            C[i] += A[j][i] * B[j]; // Multiply and accumulate
+        }
+    }
+}
+
+// a * A + b (only diag)
+template<size_t N>
+void matscale(double A[N][N], double a, double b[N]) {
+    for (size_t i = 0; i < N; i++) {
+        for (size_t j = 0; j < N; j++) {
+            A[i][j] *= a;
+        }
+        A[i][i] += b[i];
+    }
+}
+
+template<size_t N>
+void matsub(double A[N][N], double B[N][N]) {
+    for (size_t i = 0; i < N; i++) {
+        for (size_t j = 0; j < N; j++) {
+            A[i][j] -= B[i][j];
+        }
+    }
+}
+
+// imported from tinyfvm
+template<size_t N>
+void small_inv(double A[N][N]) {
+    double L[N][N] = {};
+    double U[N][N] = {};
+    double aux[N] = {};
+    double dot;
+    std::memcpy(U, A, sizeof(U));
+
+    // LU decomposition
+    // L's diag has zeros and U's diag are inverted
+    for (int i = 0; i < N; i++) {
+        for (int j = i+1; j < N; j++) {
+            double factor = U[j][i] / U[i][i];
+            L[j][i] = factor;
+            for (int k = 0; k < N; k++) {
+                U[j][k] -= factor * U[i][k];
+            }
+        }
+        U[i][i] = 1.0 / U[i][i]; // precompute the inverse of diag
+    }
+
+    for (int i = 0; i < N; i++) {
+        // forward substitution
+        for (int j = 0; j < i; j++) {
+            dot = 0.0;
+            for (int k = 0; k < j; k++) {
+                dot += L[j][k] * aux[k];
+            }
+            aux[j] = - dot;
+        }
+        dot = 0.0;
+        for (int k = 0; k < i; k++) {
+            dot += L[i][k] * aux[k];
+        }
+        aux[i] = 1.0 - dot;
+        for (int j = i+1; j < N; j++) {
+            dot = 0.0;
+            for (int k = 0; k < j; k++) {
+                dot += L[j][k] * aux[k];
+            }
+            aux[j] = - dot;
+        }
+
+        // backward substitution
+        for (int j = N; j != 0;) {
+            j--;
+            dot = 0.0;
+            for (int k = j+1; k < N; k++) {
+                dot += U[j][k] * aux[k];
+            }
+            aux[j] = (aux[j] - dot) * U[j][j]; // U diag already inverted
+        }
+
+        // modify single column
+        for (int j = 0; j < N; j++) {
+            A[j][i] = aux[j]; // scatter
+        }
+    }
+}
+
+class BeamWarming : public Scheme {
+    public:
+    jacobian_t jac;
+    u_vec_t rhs; // precomputed convective flux
+
+    void compute_rhs(u_vec_t& u) {
+        static const f64 eps_e = 0.125;
+
+        for (u64 i = 1; i < u.size()-1; i++) {
+            u_t u_l = u.get(i-1);
+            u_t u_c = u.get(i);
+            u_t u_r = u.get(i+1);
+
+            w_t w_l(u_l, m.area[i-1]);
+            w_t w_c(u_c, m.area[i]);
+            w_t w_r(u_r, m.area[i+1]);
+
+            // yes im computing same flux multiple times but whatever
+            u_t f_l = convective_flux(w_l, m.area[i-1]);
+            //u_t f_c = convective_flux(w_c, m.area[i]);
+            u_t f_r = convective_flux(w_r, m.area[i+1]);
+
+            u_t dissip;
+            dissip.rho_a = eps_e * (u_r.rho_a - 2.0 * u_c.rho_a + u_l.rho_a);
+            dissip.rho_ua = eps_e * (u_r.rho_ua - 2.0 * u_c.rho_ua + u_l.rho_ua);
+            dissip.ea = eps_e * (u_r.ea - 2.0 * u_c.ea + u_l.ea);
+
+            rhs.rho_a[i] = - ts->dt[i] * (f_r.rho_a - f_l.rho_a) / (2.0 * m.dx) - dissip.rho_a;
+            rhs.rho_ua[i] = - ts->dt[i] * (f_r.rho_ua - f_l.rho_ua) / (2.0 * m.dx) + ts->dt[i] * w_c.p * (m.area[i+1] - m.area[i-1]) / (2.0 * m.dx) - dissip.rho_ua;
+            rhs.ea[i] = - ts->dt[i] * (f_r.ea - f_l.ea) / (2.0 * m.dx) - dissip.ea;
+        }
+    }
+
+    f64 gs_sweep(u_vec_t& u, u_vec_t& update) {
+        static const f64 eps_i = 2.5 * 0.125; // eps_i = 2.5 * eps_e
+        f64 residual = 0.0;
+
+        for (u64 i = 1; i < u.size() - 1; i++) {
+            u_t acc = rhs.get(i);
+            block_t b_r = jac[i+1];
+            block_t b_l = jac[i-1];
+            f64 upd_r[3] = {update.rho_a[i+1], update.rho_ua[i+1], update.ea[i+1]};
+            f64 upd_l[3] = {update.rho_a[i-1], update.rho_ua[i-1], update.ea[i-1]};
+            f64 c_r[3] = {};
+            f64 c_l[3] = {};
+
+            f64 eps[3] = {0.0, 0.0, 0.0};
+
+            matscale<3>(b_r.data(), ts->dt[i] / (4.0 * m.dx), eps);
+            matscale<3>(b_l.data(), - ts->dt[i] / (4.0 * m.dx), eps);
+
+            matvec<3>(b_r.data(), upd_r, c_r);
+            matvec<3>(b_l.data(), upd_l, c_l);
+
+            acc.rho_a -= (c_r[0] + c_l[0]);
+            acc.rho_ua -= (c_r[1] + c_l[1]);
+            acc.ea -= (c_r[2] + c_l[2]);
+
+            // multiply by inv of diag block but rn is just I
+            f64 diff = acc.rho_a - update.rho_a[i];
+            residual += diff * diff;
+
+            update.rho_a[i] = acc.rho_a;
+            update.rho_ua[i] = acc.rho_ua;
+            update.ea[i] = acc.ea;
+        }
+        return std::sqrt(residual) / (u.size() - 2);
+    };
+
+    void solution(u_vec_t& u, u_vec_t& update) override {
+        bc->apply(u, m.area);
+        compute_rhs(u);
+        compute_jacobian(u, m.area, jac);
+
+        f64 gs_residual0 = gs_sweep(u, update);
+        f64 gs_residual = gs_residual0;
+        u32 sweep = 1;
+        while(std::log10(gs_residual0 / gs_residual) < 3.0 && sweep < 100) {
+            gs_residual = gs_sweep(u, update);
+            sweep++;
+        }
+    }
+
+    BeamWarming(Mesh& m_): Scheme(m_) {
+        jac.resize(m.n+2); // using all
+        rhs.alloc(m.n+2); // but only using [1:end-1]
+    }
+};
+
 f64 update_solution(u_vec_t& u, u_vec_t& update) {
     f64 residual_l2 = 0.0;
-    for (u64 i = 1; i < u.rho_a.size()-1; i++) {
+    for (u64 i = 1; i < u.size()-1; i++) {
         u.rho_a[i] += update.rho_a[i];
         u.rho_ua[i] += update.rho_ua[i];
         u.ea[i] += update.ea[i];
@@ -288,8 +523,8 @@ int main(int argc, char** argv) {
     const std::vector<std::string> schemes = {"mac-cormack", "beam-warming"};
     const std::vector<std::string> test_cases = {"shock-tube", "nozzle"};
     
-    u32 scheme_idx = 0;
-    u32 test_case_idx = 1;
+    u32 scheme_idx = 1;
+    u32 test_case_idx = 0;
     u64 n = 300;
 
     std::string scheme = schemes.at(scheme_idx);
@@ -342,6 +577,8 @@ int main(int argc, char** argv) {
     // Setup scheme
     if (scheme == "mac-cormack") {
         s = std::make_unique<MacCormack>(mesh);
+    } else if (scheme == "beam-warming") {
+        s = std::make_unique<BeamWarming>(mesh);
     } else {
         std::cout << "Scheme not implemented\n";
         return 1;
@@ -386,7 +623,7 @@ int main(int argc, char** argv) {
 
         sciplot::Vec x = sciplot::linspace(0.0, 1.0, n+2);
         sciplot::Plot2D plot1;
-        plot1.drawCurve(x, u.rho_a).label("mc-cormack").lineWidth(2);
+        plot1.drawCurve(x, u.rho_a).label(scheme).lineWidth(2);
         plot1.drawCurve(x_exact, rho_exact).label("exact").lineWidth(2);
 
         sciplot::Figure figure = {{plot1}};
