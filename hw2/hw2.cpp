@@ -97,6 +97,12 @@ struct u_vec_t {
     u64 size() const {
         return rho_a.size();
     }
+
+    void fill(f64 value) {
+        std::fill(rho_a.begin(), rho_a.end(), value);
+        std::fill(rho_ua.begin(), rho_ua.end(), value);
+        std::fill(ea.begin(), ea.end(), value);
+    }
 };
 
 // primitive variables vectors
@@ -199,7 +205,7 @@ class Nozzle : public BoundaryCondition {
 
 class TimeState {
     public:
-    f64 cfl = 1.0;
+    f64 cfl = 0.5;
     f64 residual0 = 1.0; // initial residual
     std::vector<f64> dt;
     virtual void calc_dt(const Mesh& m, const u_vec_t& u) = 0;
@@ -350,10 +356,10 @@ void matscale(double A[N][N], double a, double b[N]) {
 }
 
 template<size_t N>
-void matsub(double A[N][N], double B[N][N]) {
+void matadd(double A[N][N], double B[N][N]) {
     for (size_t i = 0; i < N; i++) {
         for (size_t j = 0; j < N; j++) {
-            A[i][j] -= B[i][j];
+            A[i][j] += B[i][j];
         }
     }
 }
@@ -460,10 +466,6 @@ class BeamWarming : public Scheme {
             u_t u_l = u.get(i-1);
             u_t u_c = u.get(i);
             u_t u_r = u.get(i+1);
-            u_t dissip;
-            dissip.rho_a = eps_i * (u_r.rho_a - 2.0 * u_c.rho_a + u_l.rho_a);
-            dissip.rho_ua = eps_i * (u_r.rho_ua - 2.0 * u_c.rho_ua + u_l.rho_ua);
-            dissip.ea = eps_i * (u_r.ea - 2.0 * u_c.ea + u_l.ea);
 
             u_t acc = rhs.get(i);
             block_t b_r = jac[i+1];
@@ -474,27 +476,46 @@ class BeamWarming : public Scheme {
             f64 c_l[3] = {};
 
             //f64 eps[3] = {0.0, 0.0, 0.0};
-            f64 eps[3] = {-dissip.rho_a, -dissip.rho_ua, -dissip.ea};
+            f64 C[3] = {};
 
+            block_t diag;
+            diag(0,0) = 1.0 + 2.0*eps_i;
+            diag(1,1) = 1.0 + 2.0*eps_i;
+            diag(2,2) = 1.0 + 2.0*eps_i;
+        
+            f64 eps[3] = {-eps_i, -eps_i, -eps_i};
+            
             matscale<3>(b_r.data(), ts->dt[i] / (4.0 * m.dx), eps);
             matscale<3>(b_l.data(), - ts->dt[i] / (4.0 * m.dx), eps);
 
             matvec<3>(b_r.data(), upd_r, c_r);
             matvec<3>(b_l.data(), upd_l, c_l);
 
-            acc.rho_a -= (c_r[0] + c_l[0]);
-            acc.rho_ua -= (c_r[1] + c_l[1]);
-            acc.ea -= (c_r[2] + c_l[2]);
+            // hardcoded shock tube bc
+            if (i == 1) {
+                matadd<3>(diag.data(), b_l.data());
+
+                acc.rho_a -= c_r[0];
+                acc.rho_ua -= c_r[1];
+                acc.ea -= c_r[2];
+
+            } else if (i == u.size() - 2) {
+                matadd<3>(diag.data(), b_r.data());
+
+                acc.rho_a -= c_l[0];
+                acc.rho_ua -= c_l[1];
+                acc.ea -= c_l[2];
+
+            } else {
+                acc.rho_a -= (c_r[0] + c_l[0]);
+                acc.rho_ua -= (c_r[1] + c_l[1]);
+                acc.ea -= (c_r[2] + c_l[2]);
+            }
 
             f64 B[3] = {acc.rho_a, acc.rho_ua, acc.ea};
-            f64 C[3] = {};
-            
-            block_t inv_diag;
-            inv_diag(0,0) = 1 / (1.0 + 2.0*dissip.rho_a);
-            inv_diag(1,1) = 1 / (1.0 + 2.0*dissip.rho_ua);
-            inv_diag(2,2) = 1 / (1.0 + 2.0*dissip.ea);
 
-            matvec<3>(inv_diag.data(), B, C);
+            small_inv<3>(diag.data());
+            matvec<3>(diag.data(), B, C);
 
             // multiply by inv of diag block but rn is just I
             f64 diff = C[0] - update.rho_a[i];
@@ -511,6 +532,7 @@ class BeamWarming : public Scheme {
         bc->apply(u, m.area);
         compute_rhs(u);
         compute_jacobian(u, m.area, jac);
+        update.fill(0.0);
 
         f64 gs_residual0 = gs_sweep(u, update);
         f64 gs_residual = gs_residual0;
@@ -622,9 +644,9 @@ int main(int argc, char** argv) {
     s->ts->residual0 = residual0;
     f64 l2res = residual0;
 
-    // s->ts->calc_dt(mesh, u);
-    // s->solution(u, update);
-    // l2res = update_solution(u, update);
+    s->ts->calc_dt(mesh, u);
+    s->solution(u, update);
+    l2res = update_solution(u, update);
     // Solver loop
     // while (!s->ts->has_converged(l2res)) {
     //     s->ts->calc_dt(mesh, u);
