@@ -205,7 +205,7 @@ class Nozzle : public BoundaryCondition {
 
 class TimeState {
     public:
-    f64 cfl = 0.5;
+    f64 cfl = 1.0;
     f64 residual0 = 1.0; // initial residual
     std::vector<f64> dt;
     virtual void calc_dt(const Mesh& m, const u_vec_t& u) = 0;
@@ -338,6 +338,9 @@ void compute_jacobian(u_vec_t& u, std::vector<f64>& area, jacobian_t& jac) {
 template<size_t N>
 void matvec(double A[N][N], double B[N], double C[N]) {
     for (size_t i = 0; i < N; i++) {
+        C[i] = 0.0;
+    }
+    for (size_t i = 0; i < N; i++) {
         for (size_t j = 0; j < N; j++) {
             C[i] += A[i][j] * B[j]; // Multiply and accumulate
         }
@@ -346,12 +349,13 @@ void matvec(double A[N][N], double B[N], double C[N]) {
 
 // a * A + b (only diag)
 template<size_t N>
-void matscale(double A[N][N], double a, double b[N]) {
+void matscale(double A[N][N], double a, double b) {
     for (size_t i = 0; i < N; i++) {
         for (size_t j = 0; j < N; j++) {
             A[i][j] *= a;
+            //A[i][j] += b;
         }
-        A[i][i] += b[i];
+        A[i][i] += b;
     }
 }
 
@@ -429,10 +433,9 @@ class BeamWarming : public Scheme {
     public:
     jacobian_t jac;
     u_vec_t rhs; // precomputed convective flux
+    const f64 eps_e = 0.4;
 
     void compute_rhs(u_vec_t& u) {
-        static const f64 eps_e = 0.125;
-
         for (u64 i = 1; i < u.size()-1; i++) {
             u_t u_l = u.get(i-1);
             u_t u_c = u.get(i);
@@ -448,25 +451,30 @@ class BeamWarming : public Scheme {
             u_t f_r = convective_flux(w_r, m.area[i+1]);
 
             u_t dissip;
-            dissip.rho_a = eps_e * (u_r.rho_a - 2.0 * u_c.rho_a + u_l.rho_a);
-            dissip.rho_ua = eps_e * (u_r.rho_ua - 2.0 * u_c.rho_ua + u_l.rho_ua);
-            dissip.ea = eps_e * (u_r.ea - 2.0 * u_c.ea + u_l.ea);
 
-            rhs.rho_a[i] = - ts->dt[i] * (f_r.rho_a - f_l.rho_a) / (2.0 * m.dx) - dissip.rho_a;
-            rhs.rho_ua[i] = - ts->dt[i] * (f_r.rho_ua - f_l.rho_ua) / (2.0 * m.dx) + ts->dt[i] * w_c.p * (m.area[i+1] - m.area[i-1]) / (2.0 * m.dx) - dissip.rho_ua;
-            rhs.ea[i] = - ts->dt[i] * (f_r.ea - f_l.ea) / (2.0 * m.dx) - dissip.ea;
+            if (i == 1 || i == u.size()-2) {
+                dissip.rho_a = eps_e * (u_r.rho_a - 2.0 * u_c.rho_a + u_l.rho_a);
+                dissip.rho_ua = eps_e * (u_r.rho_ua - 2.0 * u_c.rho_ua + u_l.rho_ua);
+                dissip.ea = eps_e * (u_r.ea - 2.0 * u_c.ea + u_l.ea);
+            } else {
+                u_t u_rr = u.get(i+2);
+                u_t u_ll = u.get(i-2);
+                dissip.rho_a = eps_e * (u_rr.rho_a - 4.0 * u_r.rho_a + 6.0 * u_c.rho_a - 4.0 * u_l.rho_a + u_ll.rho_a);
+                dissip.rho_ua = eps_e * (u_rr.rho_ua - 4.0 * u_r.rho_ua + 6.0 * u_c.rho_ua - 4.0 * u_l.rho_ua + u_ll.rho_ua);
+                dissip.ea = eps_e * (u_rr.ea - 4.0 * u_r.ea + 6.0 * u_c.ea - 4.0 * u_l.ea + u_ll.ea);
+            }
+            
+            rhs.rho_a[i] = - ts->dt[i] * (f_r.rho_a - f_l.rho_a) / (2.0 * m.dx) - ts->dt[i] * dissip.rho_a;
+            rhs.rho_ua[i] = - ts->dt[i] * (f_r.rho_ua - f_l.rho_ua) / (2.0 * m.dx) + ts->dt[i] * w_c.p * (m.area[i+1] - m.area[i-1]) / (2.0 * m.dx) - ts->dt[i] *dissip.rho_ua;
+            rhs.ea[i] = - ts->dt[i] * (f_r.ea - f_l.ea) / (2.0 * m.dx) - ts->dt[i] *dissip.ea;
         }
     }
 
     f64 gs_sweep(u_vec_t& u, u_vec_t& update) {
-        static const f64 eps_i = 2.5 * 0.125; // eps_i = 2.5 * eps_e
+        static const f64 eps_i = 2.5 * eps_e; // eps_i = 2.5 * eps_e
         f64 residual = 0.0;
 
         for (u64 i = 1; i < u.size() - 1; i++) {
-            u_t u_l = u.get(i-1);
-            u_t u_c = u.get(i);
-            u_t u_r = u.get(i+1);
-
             u_t acc = rhs.get(i);
             block_t b_r = jac[i+1];
             block_t b_l = jac[i-1];
@@ -475,18 +483,18 @@ class BeamWarming : public Scheme {
             f64 c_r[3] = {};
             f64 c_l[3] = {};
 
-            //f64 eps[3] = {0.0, 0.0, 0.0};
             f64 C[3] = {};
+            f64 eps = eps_i * 0.5 * ts->dt[i];
+            //f64 eps = eps_i * ts->dt[i];
+            // f64 eps = eps_i;
 
             block_t diag;
-            diag(0,0) = 1.0 + 2.0*eps_i;
-            diag(1,1) = 1.0 + 2.0*eps_i;
-            diag(2,2) = 1.0 + 2.0*eps_i;
+            diag(0,0) = 1.0 + 2.0*eps;
+            diag(1,1) = 1.0 + 2.0*eps;
+            diag(2,2) = 1.0 + 2.0*eps;
         
-            f64 eps[3] = {-eps_i, -eps_i, -eps_i};
-            
-            matscale<3>(b_r.data(), ts->dt[i] / (4.0 * m.dx), eps);
-            matscale<3>(b_l.data(), - ts->dt[i] / (4.0 * m.dx), eps);
+            matscale<3>(b_r.data(), ts->dt[i] / (4.0 * m.dx), -eps);
+            matscale<3>(b_l.data(), - ts->dt[i] / (4.0 * m.dx), -eps);
 
             matvec<3>(b_r.data(), upd_r, c_r);
             matvec<3>(b_l.data(), upd_l, c_l);
@@ -537,7 +545,7 @@ class BeamWarming : public Scheme {
         f64 gs_residual0 = gs_sweep(u, update);
         f64 gs_residual = gs_residual0;
         u32 sweep = 1;
-        while(std::log10(gs_residual0 / gs_residual) < 5.0 && sweep < 100) {
+        while(std::log10(gs_residual0 / gs_residual) < 5.0 && sweep < 200) {
             std::cout << sweep << " | GS res: " << gs_residual << "\n";
             gs_residual = gs_sweep(u, update);
             sweep++;
@@ -644,17 +652,18 @@ int main(int argc, char** argv) {
     s->ts->residual0 = residual0;
     f64 l2res = residual0;
 
-    s->ts->calc_dt(mesh, u);
-    s->solution(u, update);
-    l2res = update_solution(u, update);
+    // s->ts->calc_dt(mesh, u);
+    // s->solution(u, update);
+    // l2res = update_solution(u, update);
     // Solver loop
-    // while (!s->ts->has_converged(l2res)) {
-    //     s->ts->calc_dt(mesh, u);
-    //     s->solution(u, update);
-    //     l2res = update_solution(u, update);
-    //     if (iterations % 10 == 0) std::cout << iterations << " | Residual: " << std::log10(l2res / residual0) << "\n";
-    //     iterations++;
-    // }
+    while (!s->ts->has_converged(l2res)) {
+        s->ts->calc_dt(mesh, u);
+        s->solution(u, update);
+        l2res = update_solution(u, update);
+        if (iterations % 10 == 0) std::cout << iterations << " | Residual: " << std::log10(l2res / residual0) << "\n";
+        iterations++;
+        if (iterations == 5) break;
+    }
 
     std::cout << "Iterations: " << iterations << "\n";
 
