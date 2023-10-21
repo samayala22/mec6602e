@@ -509,7 +509,7 @@ class BeamWarming : public Scheme {
             f64 c_r[3] = {};
             f64 c_l[3] = {};
             f64 C[3] = {};
-        
+
             matscale<3>(b_r.data(), ts->dt[i] / (4.0 * m.dx), -eps_i * m.area[i] / m.area[i+1]);
             matscale<3>(b_l.data(), - ts->dt[i] / (4.0 * m.dx), -eps_i * m.area[i] / m.area[i-1]);
             matscale<3>(diag.data(), - 0.5f * ts->dt[i], 1.0f + 2.0f * eps_i);
@@ -520,7 +520,7 @@ class BeamWarming : public Scheme {
             acc.rho_a -= (c_r[0] + c_l[0]);
             acc.rho_ua -= (c_r[1] + c_l[1]);
             acc.ea -= (c_r[2] + c_l[2]);
-
+            
             f64 B[3] = {acc.rho_a, acc.rho_ua, acc.ea};
 
             small_inv<3>(diag.data());
@@ -580,8 +580,8 @@ int main(int argc, char** argv) {
     const std::vector<std::string> test_cases = {"shock-tube", "nozzle"};
     
     u32 scheme_idx = 1;
-    u32 test_case_idx = 1;
-    u64 n = 200;
+    u32 test_case_idx = 0;
+    u64 n = 1000;
 
     std::string scheme = schemes.at(scheme_idx);
     std::string test_case = test_cases.at(test_case_idx);
@@ -647,6 +647,8 @@ int main(int argc, char** argv) {
         s->bc = std::make_unique<Nozzle>(1.0, 1.3 * std::sqrt(1.4), 1.0);
         s->ts = std::make_unique<Steady>(mesh, 10); // converge to 1e-10
     }
+
+    s->ts->cfl = (scheme_idx == 0) ? 1.0 : 1.0; // mac-cormack : beam-warming
     
     // First iteration
     u64 iterations = 0;
