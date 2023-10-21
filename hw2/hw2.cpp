@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <memory>
 #include <fstream>
 #include <array>
@@ -112,8 +113,18 @@ struct w_vec_t {
     std::vector<f64> p;
 };
 
+f32 nozzle_A(f32 x) {
+    return 1.398f + 0.347f * std::tanh(0.8f * x - 4.0f);
+}
+
+f32 nozzle_dA(f32 x) {
+    const f32 sech = (1.0f / std::cosh(0.8f * x - 4.0f));
+    return 0.347f * sech * sech;
+}
+
 struct Mesh {
-    std::vector<f64> area;
+    std::vector<f64> area; // area
+    std::vector<f64> darea; // derivative of area
     f32 x0 = 0.0f;
     f32 x1 = 1.0f;
     u64 n = 100;
@@ -122,6 +133,7 @@ struct Mesh {
     void set_dims(u64 size, f32 x0_, f32 x1_) {
         n = size;
         area.resize(size+2);
+        darea.resize(size+2);
         x0 = x0_;
         x1 = x1_;
         dx = (x1 - x0) / (n - 1);
@@ -129,16 +141,19 @@ struct Mesh {
 
     void generate_grid() {
         std::fill(area.begin(), area.end(), 1.0);
+        std::fill(darea.begin(), darea.end(), 0.0);
     }
 
     void generate_nozzle() {
-        f32 x = x0;
         for (u64 i = 1; i < n+1; i++) {
-            area[i] = 1.398f + 0.347f * std::tanh(0.8f * x - 4.0f); // nozzle profile 
-            x += dx;
+            area[i] = nozzle_A((i-1)*dx); // nozzle profile
+            darea[i] = nozzle_dA((i-1)*dx); 
         }
         area[0] = area[1]; // left ghost cell 
+        darea[0] = darea[1];
+
         area[n+1] = area[n]; // right ghost cell
+        darea[n+1] = darea[n];
     }
 };
 
@@ -186,19 +201,18 @@ class Nozzle : public BoundaryCondition {
         w_t lc(u.get(end-1), area[end-1]); // last cell
 
         // supersonic (Blazek Eq 8.20)
-        // u.rho_a[end] = u.rho_a[end-1];
-        // u.rho_ua[end] = u.rho_ua[end-1];
-        // u.ea[end] = u.ea[end-1];
+        u.rho_a[end] = u.rho_a[end-1];
+        u.rho_ua[end] = u.rho_ua[end-1];
+        u.ea[end] = u.ea[end-1];
 
         // subsonic (Blazek Eq 8.23)
-        f64 pb = inf.p * back_pressure_factor;
-        f64 rhob = lc.rho + (pb - lc.p) / (lc.c * lc.c);
-        f64 ub = lc.u + (lc.p - pb) / (lc.rho * lc.c);
-        f64 eb = pb / (gamma - 1) + 0.5 * rhob * ub*ub;
-
-        u.rho_a[end] = rhob * area[end];
-        u.rho_ua[end] = rhob * ub * area[end];
-        u.ea[end] = eb * area[end];
+        // f64 pb = inf.p * back_pressure_factor;
+        // f64 rhob = lc.rho + (pb - lc.p) / (lc.c * lc.c);
+        // f64 ub = lc.u + (lc.p - pb) / (lc.rho * lc.c);
+        // f64 eb = pb / (gamma - 1) + 0.5 * rhob * ub*ub;
+        // u.rho_a[end] = rhob * area[end];
+        // u.rho_ua[end] = rhob * ub * area[end];
+        // u.ea[end] = eb * area[end];
     }
     Nozzle(f64 rho_, f64 u_, f64 p_): inf(rho_, u_, p_) {};
 };
@@ -279,7 +293,7 @@ class MacCormack : public Scheme {
             u_t f_r = convective_flux(w_r, m.area[i+1]);
             
             pred.rho_a[i] = u.rho_a[i] - ts->dt[i] * (f_r.rho_a - f_c.rho_a) / m.dx;
-            pred.rho_ua[i] = u.rho_ua[i] - ts->dt[i] * (f_r.rho_ua - f_c.rho_ua) / m.dx + ts->dt[i] * w_c.p * (m.area[i+1] - m.area[i-1]) / (2.0 * m.dx);
+            pred.rho_ua[i] = u.rho_ua[i] - ts->dt[i] * (f_r.rho_ua - f_c.rho_ua) / m.dx + ts->dt[i] * w_c.p * m.darea[i];
             pred.ea[i] = u.ea[i] - ts->dt[i] * (f_r.ea - f_c.ea) / m.dx;
         }
 
@@ -294,7 +308,7 @@ class MacCormack : public Scheme {
             u_t f_l = convective_flux(w_l, m.area[i-1]);
 
             corr.rho_a[i] = u.rho_a[i] - ts->dt[i] * (f_c.rho_a - f_l.rho_a) / m.dx;
-            corr.rho_ua[i] = u.rho_ua[i] - ts->dt[i] * (f_c.rho_ua - f_l.rho_ua) / m.dx + ts->dt[i] * w_c.p * (m.area[i+1] - m.area[i-1]) / (2.0 * m.dx);
+            corr.rho_ua[i] = u.rho_ua[i] - ts->dt[i] * (f_c.rho_ua - f_l.rho_ua) / m.dx + ts->dt[i] * w_c.p * m.darea[i];
             corr.ea[i] = u.ea[i] - ts->dt[i] * (f_c.ea - f_l.ea) / m.dx;
         }
 
@@ -315,7 +329,7 @@ class MacCormack : public Scheme {
 using block_t = StaticMatrix<f64,3,3>;
 using jacobian_t = std::vector<block_t>;
 
-void compute_jacobian(u_vec_t& u, std::vector<f64>& area, jacobian_t& jac) {
+void compute_convective_jacobian(u_vec_t& u, std::vector<f64>& area, jacobian_t& jac) {
     static const f64 gamma = 1.4;
     for (u64 i = 0; i < u.size(); i++) {
         w_t c(u.get(i), area[i]); // cell primitives
@@ -330,6 +344,16 @@ void compute_jacobian(u_vec_t& u, std::vector<f64>& area, jacobian_t& jac) {
         jac[i](2,0) = - gamma * c.e * c.u / c.rho + (gamma - 1.0) * c.u * c.u * c.u;
         jac[i](2,1) = gamma * c.e / c.rho - 1.5 * (gamma - 1.0) * c.u * c.u;
         jac[i](2,2) = gamma * c.u;        
+    }
+}
+
+void compute_source_jacobian(u_vec_t& u, std::vector<f64>& area, std::vector<f64>& darea, jacobian_t& jac) {
+    static const f64 gamma = 1.4;
+    for (u64 i = 0; i < u.size(); i++) {
+        w_t c(u.get(i), area[i]); // cell primitives
+        jac[i](1,0) = 0.5 * (gamma - 1.0) * (darea[i] / area[i]) * c.u * c.u;
+        jac[i](1,1) = (1.0 - gamma) * (darea[i] / area[i]) * c.u;
+        jac[i](1,2) = (gamma - 1.0) * (darea[i] / area[i]);
     }
 }
 
@@ -431,9 +455,11 @@ void small_inv(double A[N][N]) {
 
 class BeamWarming : public Scheme {
     public:
-    jacobian_t jac;
+    jacobian_t jac; // convective jacobian
+    jacobian_t jac_s; // source jacobian
     u_vec_t rhs; // precomputed convective flux
-    const f64 eps_e = 0.4;
+    const f64 eps_e = 0.125;
+    const f64 eps_i = 2.5 * eps_e;
 
     void compute_rhs(u_vec_t& u) {
         for (u64 i = 1; i < u.size()-1; i++) {
@@ -464,61 +490,36 @@ class BeamWarming : public Scheme {
                 dissip.ea = eps_e * (u_rr.ea - 4.0 * u_r.ea + 6.0 * u_c.ea - 4.0 * u_l.ea + u_ll.ea);
             }
             
-            rhs.rho_a[i] = - ts->dt[i] * (f_r.rho_a - f_l.rho_a) / (2.0 * m.dx) - ts->dt[i] * dissip.rho_a;
-            rhs.rho_ua[i] = - ts->dt[i] * (f_r.rho_ua - f_l.rho_ua) / (2.0 * m.dx) + ts->dt[i] * w_c.p * (m.area[i+1] - m.area[i-1]) / (2.0 * m.dx) - ts->dt[i] *dissip.rho_ua;
-            rhs.ea[i] = - ts->dt[i] * (f_r.ea - f_l.ea) / (2.0 * m.dx) - ts->dt[i] *dissip.ea;
+            rhs.rho_a[i] = - ts->dt[i] * (f_r.rho_a - f_l.rho_a) / (2.0 * m.dx) - dissip.rho_a;
+            rhs.rho_ua[i] = - ts->dt[i] * (f_r.rho_ua - f_l.rho_ua) / (2.0 * m.dx) + ts->dt[i] * w_c.p * m.darea[i] - dissip.rho_ua;
+            rhs.ea[i] = - ts->dt[i] * (f_r.ea - f_l.ea) / (2.0 * m.dx) - dissip.ea;
         }
     }
 
     f64 gs_sweep(u_vec_t& u, u_vec_t& update) {
-        static const f64 eps_i = 2.5 * eps_e; // eps_i = 2.5 * eps_e
         f64 residual = 0.0;
 
         for (u64 i = 1; i < u.size() - 1; i++) {
             u_t acc = rhs.get(i);
             block_t b_r = jac[i+1];
             block_t b_l = jac[i-1];
+            block_t diag = jac_s[i];
             f64 upd_r[3] = {update.rho_a[i+1], update.rho_ua[i+1], update.ea[i+1]};
             f64 upd_l[3] = {update.rho_a[i-1], update.rho_ua[i-1], update.ea[i-1]};
             f64 c_r[3] = {};
             f64 c_l[3] = {};
-
             f64 C[3] = {};
-            f64 eps = eps_i * 0.5 * ts->dt[i];
-            //f64 eps = eps_i * ts->dt[i];
-            // f64 eps = eps_i;
-
-            block_t diag;
-            diag(0,0) = 1.0 + 2.0*eps;
-            diag(1,1) = 1.0 + 2.0*eps;
-            diag(2,2) = 1.0 + 2.0*eps;
         
-            matscale<3>(b_r.data(), ts->dt[i] / (4.0 * m.dx), -eps);
-            matscale<3>(b_l.data(), - ts->dt[i] / (4.0 * m.dx), -eps);
+            matscale<3>(b_r.data(), ts->dt[i] / (4.0 * m.dx), -eps_i * m.area[i] / m.area[i+1]);
+            matscale<3>(b_l.data(), - ts->dt[i] / (4.0 * m.dx), -eps_i * m.area[i] / m.area[i-1]);
+            matscale<3>(diag.data(), - 0.5f * ts->dt[i], 1.0f + 2.0f * eps_i);
 
             matvec<3>(b_r.data(), upd_r, c_r);
             matvec<3>(b_l.data(), upd_l, c_l);
 
-            // hardcoded shock tube bc
-            if (i == 1) {
-                matadd<3>(diag.data(), b_l.data());
-
-                acc.rho_a -= c_r[0];
-                acc.rho_ua -= c_r[1];
-                acc.ea -= c_r[2];
-
-            } else if (i == u.size() - 2) {
-                matadd<3>(diag.data(), b_r.data());
-
-                acc.rho_a -= c_l[0];
-                acc.rho_ua -= c_l[1];
-                acc.ea -= c_l[2];
-
-            } else {
-                acc.rho_a -= (c_r[0] + c_l[0]);
-                acc.rho_ua -= (c_r[1] + c_l[1]);
-                acc.ea -= (c_r[2] + c_l[2]);
-            }
+            acc.rho_a -= (c_r[0] + c_l[0]);
+            acc.rho_ua -= (c_r[1] + c_l[1]);
+            acc.ea -= (c_r[2] + c_l[2]);
 
             f64 B[3] = {acc.rho_a, acc.rho_ua, acc.ea};
 
@@ -533,20 +534,22 @@ class BeamWarming : public Scheme {
             update.rho_ua[i] = C[1];
             update.ea[i] = C[2];
         }
-        return std::sqrt(residual) / (u.size() - 2);
+        return std::sqrt(residual) / (u.size() - 2); // residual normalizating
     };
 
     void solution(u_vec_t& u, u_vec_t& update) override {
-        bc->apply(u, m.area);
+        bc->apply(u, m.area); // applied before anything
         compute_rhs(u);
-        compute_jacobian(u, m.area, jac);
+        compute_convective_jacobian(u, m.area, jac);
+        compute_source_jacobian(u, m.area, m.darea, jac_s);
+
         update.fill(0.0);
 
         f64 gs_residual0 = gs_sweep(u, update);
         f64 gs_residual = gs_residual0;
         u32 sweep = 1;
         while(std::log10(gs_residual0 / gs_residual) < 5.0 && sweep < 200) {
-            std::cout << sweep << " | GS res: " << gs_residual << "\n";
+            //std::cout << sweep << " | GS res: " << gs_residual << "\n";
             gs_residual = gs_sweep(u, update);
             sweep++;
         }
@@ -554,6 +557,7 @@ class BeamWarming : public Scheme {
 
     BeamWarming(Mesh& m_): Scheme(m_) {
         jac.resize(m.n+2); // using all
+        jac_s.resize(m.n+2); // using all
         rhs.alloc(m.n+2); // but only using [1:end-1]
     }
 };
@@ -576,8 +580,8 @@ int main(int argc, char** argv) {
     const std::vector<std::string> test_cases = {"shock-tube", "nozzle"};
     
     u32 scheme_idx = 1;
-    u32 test_case_idx = 0;
-    u64 n = 300;
+    u32 test_case_idx = 1;
+    u64 n = 200;
 
     std::string scheme = schemes.at(scheme_idx);
     std::string test_case = test_cases.at(test_case_idx);
@@ -614,7 +618,7 @@ int main(int argc, char** argv) {
     } else if (test_case == "nozzle") {
         mesh.set_dims(n, 0.0f, 10.0f);
         mesh.generate_nozzle();
-        f64 u_vel = 1.3 * std::sqrt(1.4); // we set p = rho = 1.0 and mach = 1.25
+        f64 u_vel = 1.3 * std::sqrt(1.4); // we set p = rho = 1.0 and mach = 1.3
         w_t inf(1.0, u_vel, 1.0);
         for (u64 i = 1; i < n+1; i++) {
             u.rho_a[i] = inf.rho * mesh.area[i];
@@ -652,9 +656,6 @@ int main(int argc, char** argv) {
     s->ts->residual0 = residual0;
     f64 l2res = residual0;
 
-    // s->ts->calc_dt(mesh, u);
-    // s->solution(u, update);
-    // l2res = update_solution(u, update);
     // Solver loop
     while (!s->ts->has_converged(l2res)) {
         s->ts->calc_dt(mesh, u);
@@ -662,7 +663,6 @@ int main(int argc, char** argv) {
         l2res = update_solution(u, update);
         if (iterations % 10 == 0) std::cout << iterations << " | Residual: " << std::log10(l2res / residual0) << "\n";
         iterations++;
-        if (iterations == 5) break;
     }
 
     std::cout << "Iterations: " << iterations << "\n";
