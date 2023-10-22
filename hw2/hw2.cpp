@@ -1,15 +1,18 @@
-#include <vector>
-#include <iostream>
-#include <cstdint>
 #include <algorithm>
-#include <cmath>
-#include <cstring>
-#include <memory>
-#include <fstream>
 #include <array>
+#include <cassert>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <vector>
 
-#include "sciplot/sciplot.hpp"
+#include "sciplot/sciplot.hpp" // has gnuplot as a dependency
 
+using i32 = std::int32_t;
+using i64 = std::int64_t;
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 
@@ -106,17 +109,12 @@ struct u_vec_t {
     }
 };
 
-// primitive variables vectors
-struct w_vec_t {
-    std::vector<f64> rho;
-    std::vector<f64> u;
-    std::vector<f64> p;
-};
-
+// Diverging nozzle profile
 f32 nozzle_A(f32 x) {
     return 1.398f + 0.347f * std::tanh(0.8f * x - 4.0f);
 }
 
+// Analytical derivative (gives smoother results & improves convergence)
 f32 nozzle_dA(f32 x) {
     const f32 sech = (1.0f / std::cosh(0.8f * x - 4.0f));
     return 0.347f * sech * sech;
@@ -242,7 +240,7 @@ class Steady : public TimeState {
     public:
     f64 target_convergence;
     void calc_dt(const Mesh& m, const u_vec_t& u) override {
-        calc_dt_all(m, u);
+        calc_dt_all(m, u); // using local time-stepping
     };
     bool has_converged(f64 residual) override {
         return (std::log10(residual0 / residual) > target_convergence);
@@ -259,7 +257,7 @@ class Transient : public TimeState {
         f64 min_dt = *std::min_element(dt.begin()+1, dt.end()-1);
         if (t + min_dt > t_final) min_dt = t_final - t;
         t += min_dt;
-        std::fill(dt.begin(), dt.end(), min_dt);
+        std::fill(dt.begin(), dt.end(), min_dt); // global time-stepping
     };
     bool has_converged(f64 residual) override {
         return (t == t_final);
@@ -392,7 +390,7 @@ void matadd(double A[N][N], double B[N][N]) {
     }
 }
 
-// imported from tinyfvm
+// LU routine - imported from tinyfvm
 template<size_t N>
 void small_inv(double A[N][N]) {
     double L[N][N] = {};
@@ -457,9 +455,11 @@ class BeamWarming : public Scheme {
     public:
     jacobian_t jac; // convective jacobian
     jacobian_t jac_s; // source jacobian
-    u_vec_t rhs; // precomputed convective flux
-    const f64 eps_e = 0.125;
-    const f64 eps_i = 2.5 * eps_e;
+    u_vec_t rhs; // right hand side
+
+    // dissipation coefficients
+    const f64 eps_e = 0.125; // explicit dissip
+    const f64 eps_i = 2.5 * eps_e; // implicit dissip
 
     void compute_rhs(u_vec_t& u) {
         for (u64 i = 1; i < u.size()-1; i++) {
@@ -473,11 +473,11 @@ class BeamWarming : public Scheme {
 
             // yes im computing same flux multiple times but whatever
             u_t f_l = convective_flux(w_l, m.area[i-1]);
-            //u_t f_c = convective_flux(w_c, m.area[i]);
             u_t f_r = convective_flux(w_r, m.area[i+1]);
 
             u_t dissip;
 
+            // 4th order dissipation for all but the first and last real cells
             if (i == 1 || i == u.size()-2) {
                 dissip.rho_a = eps_e * (u_r.rho_a - 2.0 * u_c.rho_a + u_l.rho_a);
                 dissip.rho_ua = eps_e * (u_r.rho_ua - 2.0 * u_c.rho_ua + u_l.rho_ua);
@@ -496,6 +496,7 @@ class BeamWarming : public Scheme {
         }
     }
 
+    // Single gauss-seidel sweep using matrix-free approach (this code is garbage but whatever)
     f64 gs_sweep(u_vec_t& u, u_vec_t& update) {
         f64 residual = 0.0;
 
@@ -526,15 +527,14 @@ class BeamWarming : public Scheme {
             small_inv<3>(diag.data());
             matvec<3>(diag.data(), B, C);
 
-            // multiply by inv of diag block but rn is just I
-            f64 diff = C[0] - update.rho_a[i];
-            residual += diff * diff;
+            f64 diff = C[0] - update.rho_a[i]; 
+            residual += diff * diff; // absolute difference squared used as convergence residual criterion
 
             update.rho_a[i] = C[0];
             update.rho_ua[i] = C[1];
             update.ea[i] = C[2];
         }
-        return std::sqrt(residual) / (u.size() - 2); // residual normalizating
+        return std::sqrt(residual) / (u.size() - 2); // residual normalization
     };
 
     void solution(u_vec_t& u, u_vec_t& update) override {
@@ -562,6 +562,7 @@ class BeamWarming : public Scheme {
     }
 };
 
+// Update the solution: u_n+1 = u_n + delta_u_n & return the l2 norm of the residual
 f64 update_solution(u_vec_t& u, u_vec_t& update) {
     f64 residual_l2 = 0.0;
     for (u64 i = 1; i < u.size()-1; i++) {
@@ -576,25 +577,46 @@ f64 update_solution(u_vec_t& u, u_vec_t& update) {
 int main(int argc, char** argv) {
     std::cout << "-- HW2 --\n";
 
+    // Options
     const std::vector<std::string> schemes = {"mac-cormack", "beam-warming"};
     const std::vector<std::string> test_cases = {"shock-tube", "nozzle"};
     
-    u32 scheme_idx = 1;
+    // Default values
+    u32 scheme_idx = 0;
     u32 test_case_idx = 0;
     u64 n = 1000;
+
+    std::cout << argc << "\n";
+
+    // Setup
+    if (argc != 4 && argc != 1) {
+        std::cout << "Usage: ./hw2 <scheme#> <test_case#> <n>\n";
+        std::cout << "Schemes: [0] mac-cormack, [1] beam-warming\n";
+        std::cout << "Test cases: [0] shock-tube, [1] nozzle\n";
+        std::cout << "n: number of points\n";
+        return 1;
+    } else if (argc == 4) {
+        scheme_idx = static_cast<u32>(std::stoi(argv[1]));
+        test_case_idx = static_cast<u32>(std::stoi(argv[2]));
+        n = static_cast<u64>(std::stoi(argv[3]));
+        if (scheme_idx >= schemes.size()) throw std::runtime_error("Invalid scheme");
+        if (test_case_idx >= test_cases.size()) throw std::runtime_error("Invalid test case");
+    }
 
     std::string scheme = schemes.at(scheme_idx);
     std::string test_case = test_cases.at(test_case_idx);
 
+    // Init mesh & solver
     Mesh mesh;
     std::unique_ptr<Scheme> s;
 
+    // Create & allocate solution vector
     u_vec_t u; // u_n
     u_vec_t update; // delta_u_n
     u.alloc(n+2);
     update.alloc(n+2);
 
-    // Setup test case
+    // Setup test case mesh & initial conditions
     if (test_case == "shock-tube") {
         mesh.set_dims(n, 0.0f, 1.0f);
         mesh.generate_grid();
@@ -640,6 +662,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Setup solver's boundary condition and time-state
     if (test_case == "shock-tube") {
         s->bc = std::make_unique<ShockTube>();
         s->ts = std::make_unique<Transient>(mesh, 0.2); // t_final = 250
@@ -648,29 +671,31 @@ int main(int argc, char** argv) {
         s->ts = std::make_unique<Steady>(mesh, 10); // converge to 1e-10
     }
 
+    // Set solver cfl
     s->ts->cfl = (scheme_idx == 0) ? 1.0 : 1.0; // mac-cormack : beam-warming
     
-    // First iteration
+    // First iteration (for residual0)
     u64 iterations = 0;
     s->ts->calc_dt(mesh, u);
     s->solution(u, update);
     f64 residual0 = update_solution(u, update);
     s->ts->residual0 = residual0;
-    f64 l2res = residual0;
+    f64 residual = residual0;
 
     // Solver loop
-    while (!s->ts->has_converged(l2res)) {
+    while (!s->ts->has_converged(residual)) {
         s->ts->calc_dt(mesh, u);
         s->solution(u, update);
-        l2res = update_solution(u, update);
-        if (iterations % 10 == 0) std::cout << iterations << " | Residual: " << std::log10(l2res / residual0) << "\n";
+        residual = update_solution(u, update);
+        if (iterations % 10 == 0) std::cout << iterations << " | Residual: " << std::log10(residual / residual0) << "\n";
         iterations++;
     }
 
-    std::cout << "Iterations: " << iterations << "\n";
+    std::cout << "Total Iterations: " << iterations << "\n";
 
+    // Plotting
     if (test_case == "shock-tube") {
-        std::ifstream sod_tube("sod-exact_solution.txt");
+        std::ifstream sod_tube("../../../../sod-exact_solution.txt");
         std::vector<f64> x_exact;
         std::vector<f64> rho_exact;
         while (!sod_tube.eof()) {
