@@ -586,8 +586,6 @@ int main(int argc, char** argv) {
     u32 test_case_idx = 0;
     u64 n = 1000;
 
-    std::cout << argc << "\n";
-
     // Setup
     if (argc != 4 && argc != 1) {
         std::cout << "Usage: ./hw2 <scheme#> <test_case#> <n>\n";
