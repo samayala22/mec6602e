@@ -19,6 +19,9 @@ using u64 = std::uint64_t;
 using f32 = float;
 using f64 = double;
 
+static constexpr f64 EPS_d = 2.22045e-16;
+static constexpr f32 EPS_f = 1.19209e-07f;
+
 // taken from tinyfvm
 // row major (M = nb_row, N = nb_col)
 template<typename T, size_t M, size_t N>
@@ -127,6 +130,7 @@ struct Mesh {
     f32 x1 = 1.0f;
     u64 n = 100;
     f32 dx = 0.0f; 
+    f32 dx_nd; // non-dimensional dx
 
     void set_dims(u64 size, f32 x0_, f32 x1_) {
         n = size;
@@ -135,6 +139,7 @@ struct Mesh {
         x0 = x0_;
         x1 = x1_;
         dx = (x1 - x0) / (n - 1);
+        dx_nd = dx / (x1 - x0);
     }
 
     void generate_grid() {
@@ -222,6 +227,7 @@ class TimeState {
     std::vector<f64> dt;
     virtual void calc_dt(const Mesh& m, const u_vec_t& u) = 0;
     virtual bool has_converged(f64 residual) = 0;
+    virtual void print_progress() = 0;
     
     void calc_dt_all(const Mesh& m, const u_vec_t& u) {
         for (u64 i = 1; i < m.n+1; i++) {
@@ -238,14 +244,20 @@ class TimeState {
 
 class Steady : public TimeState {
     public:
-    f64 target_convergence;
-    void calc_dt(const Mesh& m, const u_vec_t& u) override {
-        calc_dt_all(m, u); // using local time-stepping
-    };
-    bool has_converged(f64 residual) override {
-        return (std::log10(residual0 / residual) > target_convergence);
-    }
-    Steady(Mesh& m, f64 target_convergence_): TimeState(m), target_convergence(target_convergence_) {};
+        void calc_dt(const Mesh& m, const u_vec_t& u) override {
+            calc_dt_all(m, u); // using local time-stepping
+        };
+        bool has_converged(f64 residual) override {
+            residual_ = residual;
+            return (std::log10(residual0 / residual) > target_convergence);
+        }
+        void print_progress() override {
+            std::printf("Residual: %f / %f \n", std::log10(residual0 / residual_), target_convergence);
+        }
+        Steady(Mesh& m, f64 target_convergence_=10.0): TimeState(m), target_convergence(target_convergence_) {};
+    private:
+        f64 residual_ = 1.0;
+        const f64 target_convergence;
 };
 
 class Transient : public TimeState {
@@ -255,12 +267,16 @@ class Transient : public TimeState {
     void calc_dt(const Mesh& m, const u_vec_t& u) override {
         calc_dt_all(m, u);
         f64 min_dt = *std::min_element(dt.begin()+1, dt.end()-1);
+
         if (t + min_dt > t_final) min_dt = t_final - t;
         t += min_dt;
         std::fill(dt.begin(), dt.end(), min_dt); // global time-stepping
     };
     bool has_converged(f64 residual) override {
         return (t == t_final);
+    }
+    void print_progress() override {
+        std::printf("t: %f / %f \n", t, t_final);
     }
     Transient(Mesh& m, f64 t_final_): TimeState(m), t_final(t_final_) {};
 };
@@ -276,41 +292,79 @@ class Scheme {
     virtual ~Scheme() = default;
 };
 
+class VanLeer {
+    public:
+    f64 operator ()(f64 r) {
+        return (r + std::abs(r)) / (1.0 + std::abs(r));
+    }
+};
+
+class Minmod {
+    public:
+    f64 operator ()(f64 r) {
+        return std::max(0.0, std::min(1.0, r));
+    }
+};
+
 class MacCormack : public Scheme {
     public:
     u_vec_t pred;
     u_vec_t corr;
+    Minmod limiter;
+
     void solution(u_vec_t& u, u_vec_t& update) override {
+        // f64 beta = 0.1;
+        f64 eps = 5.0e-2 * m.dx_nd;
+
         bc->apply(u, m.area);
         // predictor
         for (u64 i = 1; i < m.n+1; i++) {
-            w_t w_c = w_t(u.get(i), m.area[i]); // w cell
-            w_t w_r = w_t(u.get(i+1), m.area[i+1]); // w left cell
-
-            u_t f_c = convective_flux(w_c, m.area[i]);
-            u_t f_r = convective_flux(w_r, m.area[i+1]);
+            const u_t u_l = u.get(i-1);
+            const u_t u_c = u.get(i);
+            const u_t u_r = u.get(i+1);
             
-            pred.rho_a[i] = u.rho_a[i] - ts->dt[i] * (f_r.rho_a - f_c.rho_a) / m.dx;
-            pred.rho_ua[i] = u.rho_ua[i] - ts->dt[i] * (f_r.rho_ua - f_c.rho_ua) / m.dx + ts->dt[i] * w_c.p * m.darea[i];
-            pred.ea[i] = u.ea[i] - ts->dt[i] * (f_r.ea - f_c.ea) / m.dx;
+            const w_t w_c = w_t(u_c, m.area[i]);
+            const w_t w_r = w_t(u_r, m.area[i+1]);
+
+            const u_t f_c = convective_flux(w_c, m.area[i]);
+            const u_t f_r = convective_flux(w_r, m.area[i+1]);
+
+            // f64 eps = beta * w_c.rho * m.dx * std::abs(w_c.u) * w_c.c;
+
+            f64 visc_rho_a = ts->dt[i] * eps * (u_r.rho_a - 2.0 * u_c.rho_a + u_l.rho_a) / (m.dx * m.dx);
+            f64 visc_rho_ua = ts->dt[i] * eps * (u_r.rho_ua - 2.0 * u_c.rho_ua + u_l.rho_ua) / (m.dx * m.dx);
+            f64 visc_ea = ts->dt[i] * eps * (u_r.ea - 2.0 * u_c.ea + u_l.ea) / (m.dx * m.dx);
+
+            pred.rho_a[i] = u.rho_a[i] - ts->dt[i] * (f_r.rho_a - f_c.rho_a) / m.dx + visc_rho_a;
+            pred.rho_ua[i] = u.rho_ua[i] - ts->dt[i] * (f_r.rho_ua - f_c.rho_ua) / m.dx + ts->dt[i] * w_c.p * m.darea[i] + visc_rho_ua;
+            pred.ea[i] = u.ea[i] - ts->dt[i] * (f_r.ea - f_c.ea) / m.dx + visc_ea;
         }
 
         bc->apply(pred, m.area);
 
-        // corrector
         for (u64 i = 1; i < m.n+1; i++) {
-            w_t w_c = w_t(pred.get(i), m.area[i]); // w cell
-            w_t w_l = w_t(pred.get(i-1), m.area[i-1]); // w right cell
+            const u_t u_l = pred.get(i-1);
+            const u_t u_c = pred.get(i);
+            const u_t u_r = pred.get(i+1);
 
-            u_t f_c = convective_flux(w_c, m.area[i]);
-            u_t f_l = convective_flux(w_l, m.area[i-1]);
+            const w_t w_c = w_t(u_c, m.area[i]);
+            const w_t w_l = w_t(u_l, m.area[i-1]);
 
-            corr.rho_a[i] = u.rho_a[i] - ts->dt[i] * (f_c.rho_a - f_l.rho_a) / m.dx;
-            corr.rho_ua[i] = u.rho_ua[i] - ts->dt[i] * (f_c.rho_ua - f_l.rho_ua) / m.dx + ts->dt[i] * w_c.p * m.darea[i];
-            corr.ea[i] = u.ea[i] - ts->dt[i] * (f_c.ea - f_l.ea) / m.dx;
+            const u_t f_c = convective_flux(w_c, m.area[i]);
+            const u_t f_l = convective_flux(w_l, m.area[i-1]);
+            
+            // f64 eps = beta * w_c.rho * m.dx * std::abs(w_c.u) * w_c.c;
+
+            f64 visc_rho_a = ts->dt[i] * eps * (u_r.rho_a - 2.0 * u_c.rho_a + u_l.rho_a) / (m.dx * m.dx);
+            f64 visc_rho_ua = ts->dt[i] * eps * (u_r.rho_ua - 2.0 * u_c.rho_ua + u_l.rho_ua) / (m.dx * m.dx);
+            f64 visc_ea = ts->dt[i] * eps * (u_r.ea - 2.0 * u_c.ea + u_l.ea) / (m.dx * m.dx);
+
+            corr.rho_a[i] = u.rho_a[i] - ts->dt[i] * (f_c.rho_a - f_l.rho_a) / m.dx + visc_rho_a;
+            corr.rho_ua[i] = u.rho_ua[i] - ts->dt[i] * (f_c.rho_ua - f_l.rho_ua) / m.dx + ts->dt[i] * w_c.p * m.darea[i] + visc_rho_ua;
+            corr.ea[i] = u.ea[i] - ts->dt[i] * (f_c.ea - f_l.ea) / m.dx + visc_ea;
         }
 
-        // update
+        // update (could be fused with the corrector step)
         for (u64 i = 1; i < m.n+1; i++) {
             update.rho_a[i] = 0.5 * (pred.rho_a[i] + corr.rho_a[i]) - u.rho_a[i];
             update.rho_ua[i] = 0.5 * (pred.rho_ua[i] + corr.rho_ua[i]) - u.rho_ua[i];
@@ -618,6 +672,7 @@ int main(int argc, char** argv) {
     if (test_case == "shock-tube") {
         mesh.set_dims(n, 0.0f, 1.0f);
         mesh.generate_grid();
+        std::printf("dx: %f\n", mesh.dx);
         // w_t left(4.0, 0.0, 4.0);
         // w_t right(1.0, 0.0, 1.0);
         w_t left(1.0, 0.0, 1.0);
@@ -685,7 +740,7 @@ int main(int argc, char** argv) {
         s->ts->calc_dt(mesh, u);
         s->solution(u, update);
         residual = update_solution(u, update);
-        if (iterations % 10 == 0) std::cout << iterations << " | Residual: " << std::log10(residual / residual0) << "\n";
+        if (iterations % 10 == 0) s->ts->print_progress();
         iterations++;
     }
 
